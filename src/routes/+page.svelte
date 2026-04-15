@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
+	import { fly } from 'svelte/transition';
 
 	// ─── Theme definitions ──────────────────────────────────────────────────────
 
@@ -108,16 +109,47 @@
 	let theme = $derived(themes[themeIndex]);
 	function cycleTheme() { themeIndex = (themeIndex + 1) % themes.length; }
 
-	// ─── Timer logic ───────────────────────────────────────────────────────────
+	// ─── Timer sequence ───────────────────────────────────────────────────────
 
-	let totalSeconds = $state(300);
-	let remaining = $state(300);
+	type TimerEntry = { id: number; name: string; seconds: number };
+
+	const STORAGE_KEY = 'timer-sequence';
+	const DEFAULT_SEQUENCE: TimerEntry[] = [
+		{ id: 1, name: 'Focus', seconds: 1500 },
+		{ id: 2, name: 'Short break', seconds: 300 },
+	];
+
+	function loadFromStorage(): { sequence: TimerEntry[]; nextEntryId: number } {
+		try {
+			const raw = localStorage.getItem(STORAGE_KEY);
+			if (raw) {
+				const parsed = JSON.parse(raw);
+				if (Array.isArray(parsed.sequence) && parsed.sequence.length > 0) {
+					return { sequence: parsed.sequence, nextEntryId: parsed.nextEntryId ?? parsed.sequence.length + 1 };
+				}
+			}
+		} catch {}
+		return { sequence: DEFAULT_SEQUENCE, nextEntryId: 3 };
+	}
+
+	const stored = loadFromStorage();
+
+	let sequence = $state<TimerEntry[]>(stored.sequence);
+	let seqIndex = $state(0);
+	let nextEntryId = $state(stored.nextEntryId);
+	let sidebarOpen = $state(false);
+	let uiHidden = $state(false);
+
+	$effect(() => {
+		localStorage.setItem(STORAGE_KEY, JSON.stringify({ sequence, nextEntryId }));
+	});
+
+	// ─── Timer logic ──────────────────────────────────────────────────────────
+
+	let totalSeconds = $state(stored.sequence[0].seconds);
+	let remaining = $state(stored.sequence[0].seconds);
 	let running = $state(false);
 	let overflowSeconds = $state(0);
-	let editing = $state(false);
-	let editHours = $state(0);
-	let editMinutes = $state(5);
-	let editSeconds = $state(0);
 
 	let intervalId: ReturnType<typeof setInterval> | null = null;
 
@@ -129,26 +161,67 @@
 		}, 1000);
 	}
 	function stopInterval() { if (intervalId) { clearInterval(intervalId); intervalId = null; } }
-	function start() { if (editing) commitEdit(); running = true; startInterval(); }
+	function start() { running = true; startInterval(); }
 	function pause() { running = false; stopInterval(); }
 	function reset() { pause(); remaining = totalSeconds; overflowSeconds = 0; }
 	function toggleRunning() { if (running) pause(); else start(); }
 
-	function openEdit() {
+	function loadTimer(index: number, autoStart = false) {
+		const i = ((index % sequence.length) + sequence.length) % sequence.length;
 		pause();
-		editHours = Math.floor(totalSeconds / 3600);
-		editMinutes = Math.floor((totalSeconds % 3600) / 60);
-		editSeconds = totalSeconds % 60;
-		editing = true;
-	}
-	function commitEdit() {
-		totalSeconds = Math.max(1, editHours * 3600 + editMinutes * 60 + editSeconds);
-		remaining = totalSeconds;
+		seqIndex = i;
+		totalSeconds = sequence[i].seconds;
+		remaining = sequence[i].seconds;
 		overflowSeconds = 0;
-		editing = false;
+		if (autoStart) start();
 	}
-	function cancelEdit() { editing = false; }
+
+	function nextTimer() { loadTimer(seqIndex + 1, running); }
+
 	function pad(n: number) { return String(n).padStart(2, '0'); }
+
+	function formatDuration(s: number): string {
+		const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+		return h > 0 ? `${pad(h)}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+	}
+
+	function parseDuration(str: string): number {
+		const parts = str.trim().split(':').map(p => parseInt(p) || 0);
+		if (parts.length === 3) return Math.max(1, parts[0] * 3600 + parts[1] * 60 + parts[2]);
+		if (parts.length === 2) return Math.max(1, parts[0] * 60 + parts[1]);
+		return Math.max(1, parts[0]);
+	}
+
+	function addTimer() {
+		sequence = [...sequence, { id: nextEntryId++, name: 'Timer', seconds: 300 }];
+	}
+
+	function removeTimer(id: number) {
+		if (sequence.length <= 1) return;
+		const idx = sequence.findIndex(t => t.id === id);
+		const newSeq = sequence.filter(t => t.id !== id);
+		sequence = newSeq;
+		let newIdx = seqIndex;
+		if (idx < seqIndex) newIdx = seqIndex - 1;
+		else if (idx === seqIndex) {
+			newIdx = Math.min(seqIndex, newSeq.length - 1);
+			totalSeconds = newSeq[newIdx].seconds;
+			remaining = newSeq[newIdx].seconds;
+			overflowSeconds = 0;
+		}
+		seqIndex = newIdx;
+	}
+
+	function updateTimerName(id: number, name: string) {
+		sequence = sequence.map(t => t.id === id ? { ...t, name } : t);
+	}
+
+	function updateTimerDuration(id: number, durStr: string) {
+		const isActive = sequence[seqIndex]?.id === id;
+		const seconds = parseDuration(durStr);
+		sequence = sequence.map(t => t.id === id ? { ...t, seconds } : t);
+		if (isActive) { totalSeconds = seconds; remaining = seconds; overflowSeconds = 0; }
+	}
 
 	let displayTime = $derived.by(() => {
 		if (remaining > 0) {
@@ -163,12 +236,10 @@
 	let isOverflow = $derived(remaining === 0 && overflowSeconds > 0);
 	let barProgress = $derived(isOverflow ? Math.min(overflowSeconds / totalSeconds, 1) : remaining / totalSeconds);
 
-	// Contextual accent (flips to overflow color)
 	let ca = $derived(isOverflow ? theme.overflow : theme.accent);
 	let caHover = $derived(isOverflow ? theme.overflowHover : theme.accentHover);
 	let ct = $derived(isOverflow ? theme.overflow : theme.text);
 
-	// Progress variants
 	const DOT_COUNT = 24;
 	let filledDots = $derived(Math.round(barProgress * DOT_COUNT));
 
@@ -180,33 +251,154 @@
 		return `[${'█'.repeat(f)}${'░'.repeat(w - f)}] ${Math.round(barProgress * 100)}%`;
 	});
 
-	let durationStr = $derived.by(() => {
-		const h = Math.floor(totalSeconds / 3600), m = Math.floor((totalSeconds % 3600) / 60), s = totalSeconds % 60;
-		return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
-	});
+	let durationStr = $derived(formatDuration(totalSeconds));
+	let currentName = $derived(sequence[seqIndex]?.name ?? '');
 
-	function clampField(field: 'h' | 'm' | 's') {
-		if (field === 'h') editHours = Math.max(0, Math.min(99, editHours));
-		if (field === 'm') editMinutes = Math.max(0, Math.min(59, editMinutes));
-		if (field === 's') editSeconds = Math.max(0, Math.min(59, editSeconds));
-	}
+	// ─── Sidebar theme helpers ────────────────────────────────────────────────
+
+	let sidebarBg = $derived(
+		theme.id === 'chalk' ? '#faf5ec' :
+		theme.id === 'terminal' ? '#090909' :
+		theme.id === 'dusk' ? '#0e0c28' :
+		theme.id === 'ice' ? '#050e1a' :
+		'#0e0e0e'
+	);
+	let sidebarBorder = $derived(
+		theme.id === 'chalk' ? '#ddd5c8' :
+		theme.id === 'terminal' ? '#1a2a1a' :
+		theme.id === 'dusk' ? 'rgba(168,85,247,0.25)' :
+		theme.id === 'ice' ? 'rgba(14,165,233,0.18)' :
+		'#1c1c1c'
+	);
+	let sidebarFont = $derived(theme.id === 'terminal' ? "'Courier New',Courier,monospace" : "inherit");
 
 	function handleKeydown(e: KeyboardEvent) {
-		if (editing) {
-			if (e.key === 'Enter') { e.preventDefault(); commitEdit(); }
-			if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
-			return;
-		}
+		if ((e.target as HTMLElement).tagName === 'INPUT') return;
 		if (e.key === ' ' || e.key === 'k') { e.preventDefault(); toggleRunning(); }
 		if (e.key === 'r') { e.preventDefault(); reset(); }
-		if (e.key === 'e') { e.preventDefault(); openEdit(); }
+		if (e.key === 'n') { e.preventDefault(); nextTimer(); }
+		if (e.key === 's') { e.preventDefault(); sidebarOpen = !sidebarOpen; }
+		if (e.key === 'h') { e.preventDefault(); uiHidden = !uiHidden; }
 		if (e.key === 'q') { e.preventDefault(); cycleTheme(); }
+		if (e.key === 'Escape' && sidebarOpen) { e.preventDefault(); sidebarOpen = false; }
 	}
 
 	onDestroy(() => stopInterval());
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
+
+<!-- ─── Sidebar ──────────────────────────────────────────────────────────── -->
+{#if sidebarOpen && !uiHidden}
+<aside
+	transition:fly={{ x: 300, duration: 220, opacity: 1 }}
+	style="
+		position:fixed; right:0; top:0; bottom:0; width:280px; z-index:200;
+		background:{sidebarBg}; border-left:1px solid {sidebarBorder};
+		display:flex; flex-direction:column; font-family:{sidebarFont};
+		box-shadow:-8px 0 32px rgba(0,0,0,0.4);
+	"
+>
+	<!-- Header -->
+	<div style="display:flex; align-items:center; justify-content:space-between; padding:16px 16px 12px; border-bottom:1px solid {sidebarBorder};">
+		<span style="font-size:11px; letter-spacing:0.12em; text-transform:uppercase; color:{theme.textMuted}; font-weight:500;">Timer Sequence</span>
+		<button
+			onclick={() => sidebarOpen = false}
+			style="background:none; border:none; cursor:pointer; color:{theme.textMuted}; padding:2px; display:flex; align-items:center; justify-content:center; border-radius:4px; transition:color 0.15s;"
+			onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.color=theme.text;}}
+			onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.color=theme.textMuted;}}
+			title="Close (S or Esc)"
+		>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+			</svg>
+		</button>
+	</div>
+
+	<!-- Timer list -->
+	<div style="flex:1; overflow-y:auto; padding:8px 0;">
+		{#each sequence as timer, i}
+			<div style="
+				display:flex; align-items:center; gap:8px; padding:8px 12px;
+				border-left:2px solid {i === seqIndex ? ca : 'transparent'};
+				background:{i === seqIndex ? (theme.id === 'chalk' ? 'rgba(0,0,0,0.04)' : 'rgba(255,255,255,0.04)') : 'transparent'};
+				transition:all 0.15s;
+			">
+				<!-- Active indicator -->
+				<div style="width:6px; height:6px; border-radius:50%; flex-shrink:0; background:{i === seqIndex ? ca : 'transparent'}; border:1px solid {i === seqIndex ? ca : theme.textMuted}; opacity:{i === seqIndex ? 1 : 0.4};"></div>
+
+				<!-- Name input -->
+				<input
+					value={timer.name}
+					oninput={(e) => updateTimerName(timer.id, (e.target as HTMLInputElement).value)}
+					style="
+						flex:1; min-width:0; background:transparent; border:none; outline:none;
+						color:{i === seqIndex ? theme.text : theme.textMuted}; font-size:13px;
+						font-family:{sidebarFont}; padding:2px 0;
+						border-bottom:1px solid transparent; transition:border-color 0.15s;
+					"
+					onfocus={(e)=>{(e.target as HTMLInputElement).style.borderBottomColor=theme.textMuted;}}
+					onblur={(e)=>{(e.target as HTMLInputElement).style.borderBottomColor='transparent';}}
+					title="Timer name"
+				/>
+
+				<!-- Duration input -->
+				<input
+					value={formatDuration(timer.seconds)}
+					onblur={(e) => { updateTimerDuration(timer.id, (e.target as HTMLInputElement).value); (e.target as HTMLInputElement).style.borderBottomColor='transparent'; }}
+					onkeydown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+					onfocus={(e) => { (e.target as HTMLInputElement).select(); (e.target as HTMLInputElement).style.borderBottomColor=ca; }}
+					style="
+						width:52px; flex-shrink:0; background:transparent; border:none; outline:none;
+						color:{i === seqIndex ? ca : theme.textMuted}; font-size:12px; font-family:monospace;
+						text-align:right; padding:2px 0;
+						border-bottom:1px solid transparent; transition:border-color 0.15s;
+					"
+					title="Duration (MM:SS or H:MM:SS)"
+				/>
+
+				<!-- Remove button -->
+				<button
+					onclick={() => removeTimer(timer.id)}
+					disabled={sequence.length <= 1}
+					style="
+						background:none; border:none; cursor:pointer; color:{theme.textMuted}; padding:2px;
+						opacity:{sequence.length <= 1 ? 0.2 : 0.5}; display:flex; align-items:center;
+						flex-shrink:0; transition:opacity 0.15s;
+					"
+					onmouseenter={(e)=>{if(sequence.length>1)(e.currentTarget as HTMLElement).style.opacity='1';}}
+					onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.opacity=sequence.length<=1?'0.2':'0.5';}}
+					title="Remove"
+				>
+					<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+						<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+					</svg>
+				</button>
+			</div>
+		{/each}
+	</div>
+
+	<!-- Add timer button -->
+	<div style="padding:12px 16px; border-top:1px solid {sidebarBorder};">
+		<button
+			onclick={addTimer}
+			style="
+				width:100%; padding:8px 12px; background:transparent; border:1px solid {sidebarBorder};
+				color:{theme.textMuted}; font-size:12px; font-family:{sidebarFont}; cursor:pointer;
+				border-radius:6px; letter-spacing:0.04em; transition:all 0.15s;
+				display:flex; align-items:center; justify-content:center; gap:6px;
+			"
+			onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.borderColor=ca;(e.currentTarget as HTMLElement).style.color=ca;}}
+			onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.borderColor=sidebarBorder;(e.currentTarget as HTMLElement).style.color=theme.textMuted;}}
+		>
+			<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+				<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+			</svg>
+			Add timer
+		</button>
+	</div>
+</aside>
+{/if}
 
 <!-- ─── Shared snippets ──────────────────────────────────────────────────── -->
 
@@ -252,45 +444,53 @@
 			{/if}
 		</button>
 		<button
-			onclick={openEdit}
+			onclick={nextTimer}
 			style="width:44px; height:44px; border-radius:50%; background:{theme.surface}; border:none; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:background 0.15s; color:{theme.textMuted};"
 			onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.background=theme.surfaceHover;}}
 			onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.background=theme.surface;}}
-			title="Edit (E)"
+			title="Next timer (N)"
 		>
-			<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-				<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-				<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4Z"/>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<polygon points="5,4 15,12 5,20" fill="currentColor" stroke="none"/><line x1="19" y1="5" x2="19" y2="19"/>
+			</svg>
+		</button>
+		<button
+			onclick={() => sidebarOpen = !sidebarOpen}
+			style="width:44px; height:44px; border-radius:50%; background:{sidebarOpen ? theme.surfaceHover : theme.surface}; border:none; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:background 0.15s; color:{sidebarOpen ? ca : theme.textMuted};"
+			onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.background=theme.surfaceHover;}}
+			onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.background=sidebarOpen?theme.surfaceHover:theme.surface;}}
+			title="Timer sequence (S)"
+		>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/>
+				<line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
 			</svg>
 		</button>
 	</div>
 {/snippet}
 
+<!-- ─── Hidden / minimal view ───────────────────────────────────────────── -->
+{#if uiHidden}
+<div style="min-height:100vh; background:{theme.bg}; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:20px; user-select:none;">
+	{#if currentName}
+		<span style="font-size:11px; letter-spacing:0.16em; text-transform:uppercase; color:{theme.textMuted}; opacity:0.6;">{currentName}</span>
+	{/if}
+	<div style="font-size:clamp(5rem,22vw,11rem); font-family:monospace; font-weight:200; letter-spacing:-0.02em; color:{ct}; line-height:1;">{displayTime}</div>
+	<div style="width:min(320px,80vw); height:2px; background:{theme.track}; border-radius:999px; overflow:hidden;">
+		<div style="height:100%; width:{barProgress*100}%; background:{ca}; border-radius:999px; transition:width 1s linear, background 0.4s;"></div>
+	</div>
+	{#if isOverflow}<span style="font-size:10px; color:{theme.overflow}; opacity:0.6; letter-spacing:0.12em; text-transform:uppercase;">overtime</span>{/if}
+</div>
+
 <!-- ─── VOID ─────────────────────────────────────────────────────────────── -->
-{#if theme.id === 'void'}
+{:else if theme.id === 'void'}
 <div class="void-root" style="min-height:100vh; background:radial-gradient(ellipse at 50% 40%, #111 0%, #080808 80%); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:40px; user-select:none; padding:24px;">
 
 	<div style="display:flex; flex-direction:column; align-items:center; gap:20px; width:100%; max-width:320px;">
-		{#if editing}
-			<form onsubmit={(e)=>{e.preventDefault();commitEdit();}} style="display:flex; align-items:center; gap:8px;">
-				{#each [{v: editHours, f:'h', max:99},{v:editMinutes,f:'m',max:59},{v:editSeconds,f:'s',max:59}] as field, i}
-					{#if i > 0}<span style="font-size:3rem; color:#333; font-family:monospace; font-weight:300;">:</span>{/if}
-					<input type="number" min="0" max={field.max} value={field.v}
-						oninput={(e)=>{ const v=parseInt((e.target as HTMLInputElement).value)||0; if(field.f==='h')editHours=v; else if(field.f==='m')editMinutes=v; else editSeconds=v; clampField(field.f as 'h'|'m'|'s'); }}
-						style="width:56px; background:transparent; border:none; border-bottom:2px solid #333; color:white; font-size:3rem; font-family:monospace; font-weight:300; text-align:center; outline:none; padding-bottom:2px;"
-						onfocus={(e)=>{(e.target as HTMLInputElement).style.borderBottomColor='#6366f1';}}
-						onblur={(e)=>{(e.target as HTMLInputElement).style.borderBottomColor='#333';}}
-						placeholder="00"
-					/>
-				{/each}
-			</form>
-			<span style="font-size:11px; color:#333; letter-spacing:0.1em; text-transform:uppercase;">Enter to set · Esc to cancel</span>
-		{:else}
-			<button onclick={openEdit} style="font-size:clamp(4rem,20vw,8rem); font-family:monospace; font-weight:200; letter-spacing:-0.02em; color:{ct}; background:none; border:none; cursor:pointer; line-height:1; opacity:1; transition:opacity 0.15s; padding:0;"
-				onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.opacity='0.65';}}
-				onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.opacity='1';}}
-			>{displayTime}</button>
+		{#if currentName}
+			<span style="font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:{theme.textMuted}; opacity:0.7;">{currentName} <span style="opacity:0.4;">· {seqIndex + 1}/{sequence.length}</span></span>
 		{/if}
+		<div style="font-size:clamp(4rem,20vw,8rem); font-family:monospace; font-weight:200; letter-spacing:-0.02em; color:{ct}; line-height:1;">{displayTime}</div>
 
 		<div style="width:100%; height:1px; background:{theme.track}; border-radius:999px; overflow:hidden;">
 			<div style="height:100%; width:{barProgress*100}%; background:{ca}; border-radius:999px; transition:width 1s linear, background 0.4s;"></div>
@@ -302,7 +502,7 @@
 	{@render dotSwitcher(theme.textDim)}
 
 	<div style="display:flex; gap:16px; font-size:11px; color:{theme.textDim};">
-		{#each [['Space','play/pause'],['R','reset'],['E','edit'],['Q','theme']] as [k,l]}
+		{#each [['Space','play/pause'],['R','reset'],['N','next'],['S','sequence'],['H','hide'],['Q','theme']] as [k,l]}
 			<span><kbd style="font-family:monospace; background:#111; border:1px solid #222; color:#555; padding:2px 5px; border-radius:3px;">{k}</kbd> {l}</span>
 		{/each}
 	</div>
@@ -328,30 +528,15 @@
 				<span style="color:#00a82b;">user@localhost</span><span style="color:#555;">:</span><span style="color:#5555dd;">~</span><span style="color:#555;">$</span>
 				<span style="color:#00ff41;"> ./timer.sh --duration {durationStr}</span>
 			</div>
-			<!-- Status -->
+			<!-- Status + name -->
 			<div style="font-size:11px;color:{isOverflow?'#ff3c3c':running?'#00ff41':'#006e1c'};letter-spacing:0.08em;margin-bottom:6px;">
 				{isOverflow ? '⚠  OVERTIME' : running ? '▶  RUNNING' : '⏸  PAUSED'}
+				{#if currentName}<span style="color:#006e1c; margin-left:12px;"># {currentName} ({seqIndex+1}/{sequence.length})</span>{/if}
 			</div>
 			<!-- Time display -->
-			{#if editing}
-				<form onsubmit={(e)=>{e.preventDefault();commitEdit();}} style="display:flex; align-items:baseline; gap:6px; margin:10px 0;">
-					<span style="color:#006e1c; font-size:12px;">$ set</span>
-					{#each [{v:editHours,f:'h',max:99},{v:editMinutes,f:'m',max:59},{v:editSeconds,f:'s',max:59}] as field, i}
-						{#if i>0}<span style="font-size:clamp(1.8rem,7vw,2.8rem);color:#006e1c;">:</span>{/if}
-						<input type="number" min="0" max={field.max} value={field.v}
-							oninput={(e)=>{ const v=parseInt((e.target as HTMLInputElement).value)||0; if(field.f==='h')editHours=v; else if(field.f==='m')editMinutes=v; else editSeconds=v; clampField(field.f as 'h'|'m'|'s'); }}
-							style="width:52px; background:rgba(0,255,65,0.08); border:1px solid #006e1c; color:#00ff41; font-size:clamp(1.8rem,7vw,2.8rem); font-family:inherit; text-align:center; outline:none; border-radius:2px; padding:2px;"
-							onfocus={(e)=>{(e.target as HTMLInputElement).style.borderColor='#00ff41';}}
-							onblur={(e)=>{(e.target as HTMLInputElement).style.borderColor='#006e1c';}}
-						/>
-					{/each}
-				</form>
-				<div style="font-size:11px;color:#006e1c;margin-top:4px;">↵ enter to set &nbsp;·&nbsp; esc to cancel</div>
-			{:else}
-				<div style="font-size:clamp(3rem,12vw,5.5rem);line-height:1;margin:8px 0;color:{isOverflow?'#ff3c3c':'#00ff41'};text-shadow:0 0 24px {isOverflow?'rgba(255,60,60,0.5)':'rgba(0,255,65,0.5)'};letter-spacing:0.04em;">
-					<button onclick={openEdit} style="background:none;border:none;color:inherit;font:inherit;cursor:pointer;padding:0;text-shadow:inherit;letter-spacing:inherit;">{displayTime}<span class="cursor">█</span></button>
-				</div>
-			{/if}
+			<div style="font-size:clamp(3rem,12vw,5.5rem);line-height:1;margin:8px 0;color:{isOverflow?'#ff3c3c':'#00ff41'};text-shadow:0 0 24px {isOverflow?'rgba(255,60,60,0.5)':'rgba(0,255,65,0.5)'};letter-spacing:0.04em;">
+				{displayTime}<span class="cursor">█</span>
+			</div>
 			<!-- Text progress bar -->
 			<div style="font-size:12px;color:{isOverflow?'#ff3c3c':'#006e1c'};margin:12px 0;letter-spacing:0.01em;">{termBar}</div>
 			<!-- Bracketed buttons -->
@@ -366,18 +551,23 @@
 					onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.background='rgba(0,255,65,0.08)';}}
 					onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.background='transparent';}}
 				>[reset]</button>
-				<button onclick={openEdit}
+				<button onclick={nextTimer}
 					style="background:transparent; border:1px solid #006e1c; color:#00a82b; font-family:inherit; font-size:12px; padding:5px 14px; cursor:pointer; border-radius:2px; letter-spacing:0.05em; transition:all 0.15s;"
 					onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.background='rgba(0,255,65,0.08)';}}
 					onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.background='transparent';}}
-				>[edit]</button>
+				>[next ▶|]</button>
+				<button onclick={() => sidebarOpen = !sidebarOpen}
+					style="background:{sidebarOpen?'rgba(0,255,65,0.1)':'transparent'}; border:1px solid {sidebarOpen?'#00ff41':'#006e1c'}; color:{sidebarOpen?'#00ff41':'#00a82b'}; font-family:inherit; font-size:12px; padding:5px 14px; cursor:pointer; border-radius:2px; letter-spacing:0.05em; transition:all 0.15s;"
+					onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.background='rgba(0,255,65,0.08)';}}
+					onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.background=sidebarOpen?'rgba(0,255,65,0.1)':'transparent';}}
+				>[sequence]</button>
 			</div>
 		</div>
 	</div>
 
 	{@render dotSwitcher('#003c0f')}
 	<div style="display:flex;gap:16px;font-size:11px;color:#003c0f;font-family:'Courier New',monospace;">
-		{#each [['space','play/pause'],['r','reset'],['e','edit'],['q','theme']] as [k,l]}
+		{#each [['space','play/pause'],['r','reset'],['n','next'],['s','sequence'],['h','hide'],['q','theme']] as [k,l]}
 			<span style="color:#006e1c;">{k} <span style="color:#003c0f;">→ {l}</span></span>
 		{/each}
 	</div>
@@ -392,32 +582,11 @@
 
 		<!-- Time display -->
 		<div style="display:flex; flex-direction:column; align-items:center; gap:4px; width:100%;">
-			{#if editing}
-				<form onsubmit={(e)=>{e.preventDefault();commitEdit();}} style="display:flex; flex-direction:column; align-items:center; gap:16px;">
-					<div style="display:flex; align-items:center; gap:8px;">
-						{#each [{v:editHours,f:'h',max:99,lbl:'HH'},{v:editMinutes,f:'m',max:59,lbl:'MM'},{v:editSeconds,f:'s',max:59,lbl:'SS'}] as field, i}
-							{#if i>0}<span style="font-size:3rem;color:#c0b8ac;font-family:Georgia,serif;margin-bottom:18px;">:</span>{/if}
-							<div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-								<input type="number" min="0" max={field.max} value={field.v}
-									oninput={(e)=>{ const v=parseInt((e.target as HTMLInputElement).value)||0; if(field.f==='h')editHours=v; else if(field.f==='m')editMinutes=v; else editSeconds=v; clampField(field.f as 'h'|'m'|'s'); }}
-									style="width:70px; background:#f5f0e8; border:2px solid #d8d0c4; border-radius:8px; color:#1c1614; font-size:2.8rem; font-family:Georgia,serif; text-align:center; outline:none; padding:6px 4px; transition:border-color 0.15s;"
-									onfocus={(e)=>{(e.target as HTMLInputElement).style.borderColor='#1d4ed8';}}
-									onblur={(e)=>{(e.target as HTMLInputElement).style.borderColor='#d8d0c4';}}
-								/>
-								<span style="font-size:10px; letter-spacing:0.12em; color:#c0b8ac; text-transform:uppercase;">{field.lbl}</span>
-							</div>
-						{/each}
-					</div>
-					<span style="font-size:11px; color:#c0b8ac; letter-spacing:0.08em;">Enter to set · Esc to cancel</span>
-				</form>
-			{:else}
-				<button onclick={openEdit}
-					style="font-size:clamp(5rem,22vw,9.5rem); font-family:Georgia,'Times New Roman',serif; font-weight:400; color:{isOverflow?'#b91c1c':'#1c1614'}; background:none; border:none; cursor:pointer; line-height:1; letter-spacing:-0.02em; transition:opacity 0.15s; padding:0;"
-					onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.opacity='0.6';}}
-					onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.opacity='1';}}
-				>{displayTime}</button>
-				{#if isOverflow}<span style="font-size:11px; color:#b91c1c; letter-spacing:0.1em; text-transform:uppercase; margin-top:4px;">overtime</span>{/if}
+			{#if currentName}
+				<span style="font-size:11px; letter-spacing:0.1em; text-transform:uppercase; color:{theme.textMuted}; margin-bottom:4px;">{currentName} <span style="opacity:0.5;">· {seqIndex+1}/{sequence.length}</span></span>
 			{/if}
+			<div style="font-size:clamp(5rem,22vw,9.5rem); font-family:Georgia,'Times New Roman',serif; font-weight:400; color:{isOverflow?'#b91c1c':'#1c1614'}; line-height:1; letter-spacing:-0.02em;">{displayTime}</div>
+			{#if isOverflow}<span style="font-size:11px; color:#b91c1c; letter-spacing:0.1em; text-transform:uppercase; margin-top:4px;">overtime</span>{/if}
 		</div>
 
 		<!-- Dot progress -->
@@ -428,7 +597,7 @@
 		</div>
 
 		<!-- Physical buttons -->
-		<div style="display:flex; align-items:center; gap:12px;">
+		<div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:center;">
 			<button onclick={reset}
 				style="padding:10px 20px; border-radius:10px; background:{theme.surface}; border:1px solid #d0c8bc; box-shadow:0 2px 0 #cac2b6; color:{theme.textMuted}; font-size:13px; cursor:pointer; letter-spacing:0.04em; transition:all 0.1s; display:flex;align-items:center;gap:6px;"
 				onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.background=theme.surfaceHover;}}
@@ -450,13 +619,26 @@
 					Start
 				{/if}
 			</button>
-			<button onclick={openEdit}
+			<button onclick={nextTimer}
 				style="padding:10px 20px; border-radius:10px; background:{theme.surface}; border:1px solid #d0c8bc; box-shadow:0 2px 0 #cac2b6; color:{theme.textMuted}; font-size:13px; cursor:pointer; letter-spacing:0.04em; transition:all 0.1s; display:flex;align-items:center;gap:6px;"
 				onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.background=theme.surfaceHover;}}
 				onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.background=theme.surface;}}
 			>
-				<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4Z"/></svg>
-				Edit
+				<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+					<polygon points="4,4 14,12 4,20" fill="currentColor" stroke="none"/><line x1="18" y1="5" x2="18" y2="19"/>
+				</svg>
+				Next
+			</button>
+			<button onclick={() => sidebarOpen = !sidebarOpen}
+				style="padding:10px 20px; border-radius:10px; background:{sidebarOpen?theme.surfaceHover:theme.surface}; border:1px solid {sidebarOpen?ca+'80':'#d0c8bc'}; box-shadow:0 2px 0 #cac2b6; color:{sidebarOpen?ca:theme.textMuted}; font-size:13px; cursor:pointer; letter-spacing:0.04em; transition:all 0.1s; display:flex;align-items:center;gap:6px;"
+				onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.background=theme.surfaceHover;}}
+				onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.background=sidebarOpen?theme.surfaceHover:theme.surface;}}
+			>
+				<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+					<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/>
+					<line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
+				</svg>
+				Sequence
 			</button>
 		</div>
 	</div>
@@ -464,7 +646,7 @@
 	<div style="margin-top:28px; display:flex; flex-direction:column; align-items:center; gap:14px;">
 		{@render dotSwitcher(theme.textDim)}
 		<div style="display:flex; gap:14px; font-size:11px; color:{theme.textDim};">
-			{#each [['Space','play/pause'],['R','reset'],['E','edit'],['Q','theme']] as [k,l]}
+			{#each [['Space','play/pause'],['R','reset'],['N','next'],['S','sequence'],['H','hide'],['Q','theme']] as [k,l]}
 				<span><kbd style="font-family:monospace; background:white; border:1px solid #d8d0c8; color:#9c8e80; padding:2px 5px; border-radius:3px; box-shadow:0 1px 0 #d0c8bc;">{k}</kbd> {l}</span>
 			{/each}
 		</div>
@@ -485,26 +667,10 @@
 	<!-- Glass card -->
 	<div style="position:relative; z-index:1; background:rgba(255,255,255,0.05); backdrop-filter:blur(28px); -webkit-backdrop-filter:blur(28px); border:1px solid rgba(255,255,255,0.1); border-radius:28px; padding:clamp(36px,6vw,56px) clamp(32px,7vw,72px); box-shadow:0 8px 48px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.1); display:flex; flex-direction:column; align-items:center; gap:28px; width:min(480px,94vw);">
 
-		{#if editing}
-			<form onsubmit={(e)=>{e.preventDefault();commitEdit();}} style="display:flex; align-items:center; gap:8px;">
-				{#each [{v:editHours,f:'h',max:99},{v:editMinutes,f:'m',max:59},{v:editSeconds,f:'s',max:59}] as field, i}
-					{#if i>0}<span style="font-size:3rem; color:rgba(168,85,247,0.4); font-family:monospace; font-weight:200;">:</span>{/if}
-					<input type="number" min="0" max={field.max} value={field.v}
-						oninput={(e)=>{ const v=parseInt((e.target as HTMLInputElement).value)||0; if(field.f==='h')editHours=v; else if(field.f==='m')editMinutes=v; else editSeconds=v; clampField(field.f as 'h'|'m'|'s'); }}
-						style="width:60px; background:rgba(168,85,247,0.1); border:1px solid rgba(168,85,247,0.3); border-radius:8px; color:#f0e8ff; font-size:3rem; font-family:monospace; font-weight:200; text-align:center; outline:none; padding:4px;"
-						onfocus={(e)=>{(e.target as HTMLInputElement).style.borderColor='rgba(168,85,247,0.8)'; (e.target as HTMLInputElement).style.boxShadow='0 0 12px rgba(168,85,247,0.3)';}}
-						onblur={(e)=>{(e.target as HTMLInputElement).style.borderColor='rgba(168,85,247,0.3)'; (e.target as HTMLInputElement).style.boxShadow='none';}}
-					/>
-				{/each}
-			</form>
-			<span style="font-size:11px; color:rgba(168,85,247,0.4); letter-spacing:0.1em; text-transform:uppercase;">Enter to set · Esc to cancel</span>
-		{:else}
-			<button onclick={openEdit}
-				style="font-size:clamp(4rem,18vw,7.5rem); font-family:monospace; font-weight:200; letter-spacing:-0.02em; color:{ct}; background:none; border:none; cursor:pointer; line-height:1; padding:0; text-shadow:0 0 40px {ca}80, 0 0 80px {ca}40; transition:opacity 0.15s;"
-				onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.opacity='0.7';}}
-				onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.opacity='1';}}
-			>{displayTime}</button>
+		{#if currentName}
+			<span style="font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:rgba(168,85,247,0.5);">{currentName} <span style="opacity:0.5;">· {seqIndex+1}/{sequence.length}</span></span>
 		{/if}
+		<div style="font-size:clamp(4rem,18vw,7.5rem); font-family:monospace; font-weight:200; letter-spacing:-0.02em; color:{ct}; line-height:1; text-shadow:0 0 40px {ca}80, 0 0 80px {ca}40;">{displayTime}</div>
 
 		<!-- Glowing bar -->
 		<div style="width:100%; height:2px; background:{theme.track}; border-radius:999px; overflow:hidden; position:relative;">
@@ -518,7 +684,7 @@
 	<div style="position:relative; z-index:1; display:flex; flex-direction:column; align-items:center; gap:14px;">
 		{@render dotSwitcher(theme.textDim)}
 		<div style="display:flex; gap:16px; font-size:11px; color:{theme.textDim};">
-			{#each [['Space','play/pause'],['R','reset'],['E','edit'],['Q','theme']] as [k,l]}
+			{#each [['Space','play/pause'],['R','reset'],['N','next'],['S','sequence'],['H','hide'],['Q','theme']] as [k,l]}
 				<span><kbd style="font-family:monospace; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); color:rgba(168,85,247,0.5); padding:2px 5px; border-radius:3px;">{k}</kbd> {l}</span>
 			{/each}
 		</div>
@@ -531,46 +697,31 @@
 
 	<div style="display:flex; flex-direction:column; align-items:center; gap:28px; width:100%; max-width:500px;">
 
-		<!-- Segment digit display -->
-		{#if editing}
-			<form onsubmit={(e)=>{e.preventDefault();commitEdit();}} style="display:flex; align-items:center; gap:6px;">
-				{#each [{v:editHours,f:'h',max:99},{v:editMinutes,f:'m',max:59},{v:editSeconds,f:'s',max:59}] as field, i}
-					{#if i>0}<span style="font-size:clamp(2rem,8vw,3.5rem); color:#1e6080; font-weight:200; margin:0 2px;">:</span>{/if}
-					<input type="number" min="0" max={field.max} value={field.v}
-						oninput={(e)=>{ const v=parseInt((e.target as HTMLInputElement).value)||0; if(field.f==='h')editHours=v; else if(field.f==='m')editMinutes=v; else editSeconds=v; clampField(field.f as 'h'|'m'|'s'); }}
-						style="width:64px; background:rgba(14,165,233,0.06); border:1px solid #1e6080; border-radius:4px; color:#c8e8ff; font-size:clamp(2rem,8vw,3.5rem); font-family:inherit; font-weight:200; text-align:center; outline:none; padding:4px 2px;"
-						onfocus={(e)=>{(e.target as HTMLInputElement).style.borderColor='#0ea5e9'; (e.target as HTMLInputElement).style.boxShadow='0 0 8px rgba(14,165,233,0.3)';}}
-						onblur={(e)=>{(e.target as HTMLInputElement).style.borderColor='#1e6080'; (e.target as HTMLInputElement).style.boxShadow='none';}}
-					/>
-				{/each}
-			</form>
-			<span style="font-size:11px; color:#1e6080; letter-spacing:0.1em; text-transform:uppercase; margin-top:-8px;">Enter to set · Esc to cancel</span>
-		{:else}
-			<div style="display:flex; align-items:center; gap:4px; cursor:pointer;" onclick={openEdit}
-				onmouseenter={(e)=>{(e.currentTarget as HTMLElement).style.opacity='0.7';}}
-				onmouseleave={(e)=>{(e.currentTarget as HTMLElement).style.opacity='1';}}
-				role="button" tabindex="0" onkeydown={(e)=>{if(e.key==='Enter')openEdit();}} title="Click or E to edit"
-			>
-				{#each displayTime.split('') as char}
-					{#if /\d/.test(char)}
-						<span style="
-							font-size:clamp(2.8rem,13vw,6rem); font-weight:200; line-height:1;
-							color:{isOverflow?theme.overflow:theme.text};
-							border:1px solid {isOverflow?theme.overflow+'60':theme.textMuted+'80'};
-							border-radius:5px;
-							padding:0.04em 0.12em;
-							background:rgba(14,165,233,0.03);
-							display:inline-block;
-							text-shadow:{isOverflow?'0 0 16px '+theme.overflow:'0 0 16px rgba(14,165,233,0.3)'};
-						">{char}</span>
-					{:else if char === ':'}
-						<span style="font-size:clamp(2.8rem,13vw,6rem); font-weight:200; color:{theme.textMuted}; line-height:1; padding:0 2px; margin-top:-4px;">:</span>
-					{:else}
-						<span style="font-size:clamp(2.8rem,13vw,6rem); font-weight:200; color:{theme.overflow}; line-height:1; padding:0 2px;">{char}</span>
-					{/if}
-				{/each}
-			</div>
+		{#if currentName}
+			<span style="font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:{theme.textMuted};">{currentName} <span style="opacity:0.5;">· {seqIndex+1}/{sequence.length}</span></span>
 		{/if}
+
+		<!-- Segment digit display -->
+		<div style="display:flex; align-items:center; gap:4px;">
+			{#each displayTime.split('') as char}
+				{#if /\d/.test(char)}
+					<span style="
+						font-size:clamp(2.8rem,13vw,6rem); font-weight:200; line-height:1;
+						color:{isOverflow?theme.overflow:theme.text};
+						border:1px solid {isOverflow?theme.overflow+'60':theme.textMuted+'80'};
+						border-radius:5px;
+						padding:0.04em 0.12em;
+						background:rgba(14,165,233,0.03);
+						display:inline-block;
+						text-shadow:{isOverflow?'0 0 16px '+theme.overflow:'0 0 16px rgba(14,165,233,0.3)'};
+					">{char}</span>
+				{:else if char === ':'}
+					<span style="font-size:clamp(2.8rem,13vw,6rem); font-weight:200; color:{theme.textMuted}; line-height:1; padding:0 2px; margin-top:-4px;">:</span>
+				{:else}
+					<span style="font-size:clamp(2.8rem,13vw,6rem); font-weight:200; color:{theme.overflow}; line-height:1; padding:0 2px;">{char}</span>
+				{/if}
+			{/each}
+		</div>
 
 		<!-- Block progress -->
 		<div style="display:flex; align-items:flex-end; gap:3px; height:24px;">
@@ -601,7 +752,7 @@
 	{@render dotSwitcher(theme.textDim)}
 
 	<div style="display:flex; gap:16px; font-size:11px; color:{theme.textDim}; font-family:inherit;">
-		{#each [['Space','play/pause'],['R','reset'],['E','edit'],['Q','theme']] as [k,l]}
+		{#each [['Space','play/pause'],['R','reset'],['N','next'],['S','sequence'],['H','hide'],['Q','theme']] as [k,l]}
 			<span><kbd style="font-family:inherit; background:rgba(14,165,233,0.04); border:1px solid rgba(14,165,233,0.12); color:{theme.textMuted}; padding:2px 5px; border-radius:3px;">{k}</kbd> {l}</span>
 		{/each}
 	</div>
