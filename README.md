@@ -32,3 +32,7 @@ Built with SvelteKit, Svelte 5 and Tailwind CSS, deployed to GitHub Pages as a s
 bun install
 bun run dev
 ```
+
+## License
+
+[MIT](LICENSE)
